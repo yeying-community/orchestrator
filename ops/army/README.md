@@ -1,7 +1,7 @@
 # 跨境电商自开发维护军队（OpenClaw）
 
 ## 目标
-- 让 WhatsApp 电商机器人具备“自动巡检、自动拉起、自动产出改进建议”的能力。
+- 让 WhatsApp 电商智能体具备“自动巡检、自动拉起、自动产出改进建议”的能力。
 - 采用“生产稳定优先 + 只读自开发建议 + 人工闸门发布”的安全策略。
 
 ## 组件
@@ -16,7 +16,7 @@
 ## 快速启动
 ```bash
 cd /home/administrator/bot
-cp -n ops/army/army.env.example ops/army/army.env
+cp -n ops/army/army.env.template ops/army/army.env
 bash ops/army/bin/start_army.sh
 bash ops/army/bin/status_army.sh
 ```

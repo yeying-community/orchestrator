@@ -6,16 +6,16 @@ to make those boundaries explicit.
 
 ## Active product path
 
-These directories define the current Hub runtime and managed robot set and should be treated as
+These directories define the current Orchestrator runtime and managed agent set and should be treated as
 the main delivery path:
 
-- `hub/`: current control-plane service, static web UI, and API
-  implementation.
-- `robots/openclaw/`: current OpenClaw-based managed robot implementations.
-- `robots/nanobot/`: current nanobot code kept under the unified robot tree.
+- `backend/`: Python control-plane service and API implementation.
+- `web/`: React control-plane UI source and build configuration.
+- `agents/openclaw/`: current OpenClaw-based managed agent implementations.
+- `agents/nanobot/`: current nanobot code kept under the unified agent tree.
 - `scripts/`: bootstrap, run, stop, package, and verification entrypoints for
-  the Hub stack.
-- `config/`: runtime configuration templates used by the active stack.
+  the Orchestrator stack.
+- `backend/.env.template`: the single Orchestrator service configuration template; copy it to `backend/.env`. Agent-specific templates remain within their owning agent directory.
 - `docs/`: current product and runbook documentation.
 
 ## Active support directories
@@ -23,7 +23,7 @@ the main delivery path:
 These directories are still useful to the current repository, but they are not
 the primary production entrypoint:
 
-- `workspace/`: workspace templates used for bot instances.
+- `runtime/`: ignored local control-plane state, logs, and managed instance data.
 - `data/`: sample or domain data used by templates and experiments.
 - `ops/`: operational helper scripts and sidecar workflows.
 - `examples/`: example prompt or scenario material.
@@ -37,29 +37,29 @@ the primary production entrypoint:
 
 1. New production code should default to the active product path, not to a new
    top-level directory.
-2. New robot implementations should go under `robots/`.
+2. New agent implementations should go under `agents/`.
 3. New docs should go under `docs/`, and legacy docs should be moved to
    `docs/archive/` once they are no longer current.
 4. If a directory exists mainly for migration support, document that status in
    its local `README.md`.
 
-## Hub frontend structure
+## Orchestrator web structure
 
-The Hub frontend is currently shipped as one SPA, but its source is now
-organized for a future split into robot-specific sites:
+The Orchestrator frontend is currently shipped as one SPA, but its source is now
+organized for a future split into agent-specific sites:
 
-- `hub/frontend/src/shell/`: Hub shell, app router, and shared navigation.
-- `hub/frontend/src/platform/`: cross-app platform concerns such as auth,
+- `web/src/shell/`: Orchestrator shell, app router, and shared navigation.
+- `web/src/platform/`: cross-app platform concerns such as auth,
   UCAN-adjacent session wiring, API clients, shared types, and query setup.
-- `hub/frontend/src/apps/`: robot-facing application modules. Each robot app
+- `web/src/apps/`: agent-facing application modules. Each agent app
   should keep its own screens and business UI here.
-- `hub/frontend/dist/`: built frontend artifacts served by the Python backend.
+- `web/dist/`: built web UI artifacts served by the Python backend.
   This directory is runtime/package output and should not be committed as source.
 
 Current rule of thumb:
 
 1. Add shared control-plane concerns to `platform/`.
 2. Add global layout and routing concerns to `shell/`.
-3. Add robot-specific UI to `apps/<robot>/`.
-4. Keep new robot apps separable so they can later evolve into independent
+3. Add agent-specific UI to `apps/<agent>/`.
+4. Keep new agent apps separable so they can later evolve into independent
    sites without rewriting platform and shell concerns first.
