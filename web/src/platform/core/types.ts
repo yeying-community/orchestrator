@@ -2,6 +2,8 @@ export type AuthSession = {
   wallet_id: string
   chain_id: string | null
   auth_type?: string
+  auth_method?: string | null
+  username?: string | null
   issued_at: string
   expires_at: string
   ucan_session?: unknown
@@ -18,8 +20,10 @@ export type PlatformSession = {
   isAuthenticated: boolean
   walletId: string | null
   walletShort: string | null
+  username: string | null
   chainId: string | null
   authType: string | null
+  authMethod: string | null
   issuedAt: string | null
   expiresAt: string | null
   capability: SessionCapability
@@ -112,6 +116,9 @@ export type BotInstanceView = {
   logs_dir: string
   last_error: string | null
   dingtalk_client_id?: string | null
+  desired_state?: string
+  deployment_mode: DeploymentMode
+  schedule: InstanceSchedule | null
 }
 
 export type BotInstanceListResponse = {
@@ -126,10 +133,71 @@ export type RuntimeProvider = {
   management_mode: string
   availability: string
   capabilities: string[]
+  /** Hubs that reported this runtime adapter and can therefore host it. */
+  hub_ids: string[]
 }
 
 export type RuntimeProviderListResponse = {
   items: RuntimeProvider[]
+}
+
+export type DeploymentMode = 'service' | 'scheduled'
+
+export type RunState = 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled' | 'unknown'
+
+export type ScheduledRun = {
+  id: string
+  instance_id: string
+  trigger: 'schedule' | 'manual'
+  scheduled_for: string
+  started_at: string | null
+  finished_at: string | null
+  state: RunState
+  exit_code: number | null
+  log_ref: string | null
+  command_id: string | null
+}
+
+export type ScheduledRunListResponse = {
+  items: ScheduledRun[]
+  total: number
+}
+
+export type RuntimeInstanceActionResponse = {
+  message: string
+  instance: RuntimeInstance
+  run_id: string | null
+}
+
+export type CliRuntimeType = 'codex' | 'claude-code'
+
+export type CliTaskView = {
+  prompt: string
+  policy: string | null
+  run_timeout_seconds: number
+  model_credential_configured: boolean
+}
+
+export type CliTaskSpec = {
+  prompt: string
+  codex_sandbox?: 'read-only' | 'workspace-write' | null
+  claude_permission_mode?: 'plan' | 'acceptEdits' | 'dontAsk' | null
+  run_timeout_seconds?: number
+  model_api_key?: string | null
+}
+
+export type RuntimeInstanceCreateRequest = BotInstanceCreateRequest & {
+  runtime_type: string
+  task?: CliTaskSpec | null
+  /** Target machine; required when several Hubs can run this runtime. */
+  target_hub_id?: string | null
+}
+
+export type InstanceSchedule = {
+  kind: 'cron' | 'interval'
+  expr: string | null
+  seconds: number | null
+  timezone: string | null
 }
 
 export type RuntimeInstance = {
@@ -147,6 +215,19 @@ export type RuntimeInstance = {
   created_at: string
   updated_at: string
   capabilities: string[]
+  deployment_mode: DeploymentMode
+  schedule: InstanceSchedule | null
+  /** True once the control plane holds at least one run for this instance. */
+  schedule_executed: boolean
+  latest_run_state: RunState | null
+  latest_run_at: string | null
+  task: CliTaskView | null
+  hub_id: string | null
+  hub_status: string
+  hub_last_seen_at: string | null
+  latest_command_status: string | null
+  latest_command_operation: string | null
+  latest_command_updated_at: string | null
 }
 
 export type RuntimeInstanceListResponse = {
@@ -155,6 +236,23 @@ export type RuntimeInstanceListResponse = {
   running: number
   stopped: number
   attention: number
+}
+
+export type RuntimeHub = {
+  id: string
+  status: string
+  last_seen_at: string | null
+  adapter_count: number
+  instance_count: number
+  runtime_types: string[]
+}
+
+export type RuntimeHubListResponse = {
+  items: RuntimeHub[]
+  total: number
+  online: number
+  offline: number
+  unknown: number
 }
 
 export type BotInstanceLogsResponse = {
@@ -182,6 +280,8 @@ export type BotInstanceCreateRequest = {
   template?: string | null
   dingtalk_client_id?: string | null
   dingtalk_client_secret?: string | null
+  deployment_mode?: DeploymentMode
+  schedule?: InstanceSchedule | null
 }
 
 export type BotInstancePairResponse = {

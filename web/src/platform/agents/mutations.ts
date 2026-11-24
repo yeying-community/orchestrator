@@ -8,6 +8,8 @@ import type {
   AgentWorkspaceActionResponse,
   AgentWorkspaceConfigUpdateResponse,
   RuntimeInstance,
+  RuntimeInstanceActionResponse,
+  RuntimeInstanceCreateRequest,
 } from '../core/types'
 
 async function runAgentAction(agentKey: string, action: 'run-once' | 'start' | 'stop' | 'diagnose' | 'init-config') {
@@ -66,11 +68,32 @@ async function pairMessengerWhatsapp(instanceId: string) {
   })
 }
 
-async function runRuntimeInstanceAction(instanceId: string, action: 'start' | 'stop') {
-  return api<{ message: string; instance: RuntimeInstance }>(
+export type RuntimeInstanceAction = 'start' | 'stop' | 'run'
+
+async function runRuntimeInstanceAction(instanceId: string, action: RuntimeInstanceAction) {
+  return api<RuntimeInstanceActionResponse>(
     `/api/v1/public/runtime/instances/${instanceId}/actions/${action}`,
     { method: 'POST' },
   )
+}
+
+async function createRuntimeInstance(payload: RuntimeInstanceCreateRequest) {
+  return api<RuntimeInstance>('/api/v1/public/runtime/instances', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  })
+}
+
+export function useRuntimeInstanceCreate() {
+  const queryClient = useQueryClient()
+
+  return useMutation({
+    mutationFn: (payload: RuntimeInstanceCreateRequest) => createRuntimeInstance(payload),
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: ['runtime', 'instances'] })
+      await queryClient.invalidateQueries({ queryKey: ['runtime', 'hubs'] })
+    },
+  })
 }
 
 function invalidateAgentWorkspace(queryClient: ReturnType<typeof useQueryClient>, agentKey: string) {
@@ -177,10 +200,11 @@ export function useRuntimeInstanceAction() {
   const queryClient = useQueryClient()
 
   return useMutation({
-    mutationFn: (variables: { instanceId: string; action: 'start' | 'stop' }) =>
+    mutationFn: (variables: { instanceId: string; action: RuntimeInstanceAction }) =>
       runRuntimeInstanceAction(variables.instanceId, variables.action),
     onSettled: async () => {
       await queryClient.invalidateQueries({ queryKey: ['runtime', 'instances'] })
+      await queryClient.invalidateQueries({ queryKey: ['runtime', 'runs'] })
       await queryClient.invalidateQueries({ queryKey: ['messenger', 'instances'] })
     },
   })

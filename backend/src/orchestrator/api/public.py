@@ -1,12 +1,31 @@
 from __future__ import annotations
 
+import asyncio
+from datetime import UTC, datetime, timedelta
+from urllib.parse import urlparse
+from uuid import uuid4
+
+from cryptography.fernet import Fernet
 from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi import Query
+from fastapi.responses import JSONResponse
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 
 from orchestrator.adapters import AgentWorkspaceAdapter, get_agent_workspace_adapter
 from orchestrator.config import Settings
+from orchestrator.protocols.hub_v1 import (
+    CLI_RUNTIME_TYPES,
+    HubCliTaskCreatePayloadV1,
+    HubCommandIssueRequestV1,
+    HubCommandOperation,
+    HubInstanceScheduleV1,
+    HubOpenClawCreatePayloadV1,
+    HubOpenClawDiagnosePayloadV1,
+    HubOpenClawLogsPayloadV1,
+    HubOpenClawModelPayloadV1,
+    HubRunOncePayloadV1,
+)
 from orchestrator.storage import engine_for
 from orchestrator.models import (
     AuthChallengeRequest,
@@ -14,6 +33,9 @@ from orchestrator.models import (
     BotInstanceActionResponse,
     AuthSessionView,
     AuthSessionVerifyRequest,
+    IdentityLoginResultEnvelope,
+    IdentityLoginSessionEnvelope,
+    IdentityLoginSessionView,
     BotInstanceCreateRequest,
     BotInstanceDiagnoseResponse,
     BotInstanceListResponse,
@@ -34,7 +56,11 @@ from orchestrator.models import (
     RuntimeInstanceCreateRequest,
     RuntimeInstanceListResponse,
     RuntimeInstanceView,
+    RuntimeHubListResponse,
+    RuntimeHubView,
     RuntimeProviderListResponse,
+    ScheduledRunListResponse,
+    ScheduledRunView,
     VersionResponse,
 )
 from orchestrator.services import (
@@ -43,10 +69,29 @@ from orchestrator.services import (
     SESSION_COOKIE_NAME,
     auth_service,
 )
+from orchestrator.services.identity_auth import IdentityAuthService
 from orchestrator.services.openclaw import short_wallet
 from orchestrator.services.runtime_providers import runtime_providers
+from orchestrator.services.hubs import HubConflictError, HubNotFoundError, MachineHubService
 
 router = APIRouter(prefix="/api/v1/public", tags=["public"])
+
+
+def identity_auth_service(settings: Settings) -> IdentityAuthService:
+    return IdentityAuthService(settings, auth_service(settings))
+
+
+def set_identity_session_cookie(response: Response, settings: Settings, request: Request, token: str) -> None:
+    service = auth_service(settings)
+    response.set_cookie(
+        key=SESSION_COOKIE_NAME,
+        value=token,
+        max_age=settings.session_ttl_seconds,
+        httponly=True,
+        samesite="lax",
+        secure=service.should_secure_cookie(request),
+        path="/",
+    )
 
 
 def require_session(request: Request) -> AuthSessionView:
@@ -55,6 +100,11 @@ def require_session(request: Request) -> AuthSessionView:
     if session is None:
         raise HTTPException(status_code=401, detail="not logged in")
     return session
+
+
+def require_hub_catalog(settings: Settings) -> None:
+    if not settings.database_url:
+        raise HTTPException(status_code=503, detail="Machine Hub catalog is not configured for this Backend")
 
 
 def owner_matches_wallet(owner_wallet: str | None, wallet_id: str) -> bool:
@@ -81,6 +131,135 @@ def require_owned_instance(
     return record
 
 
+def require_owned_catalog_instance(hub_service: MachineHubService, instance_id: str, session: AuthSessionView) -> dict:
+    """Runtime-agnostic ownership check against the control-plane catalog."""
+    try:
+        item = hub_service.catalog_instance(instance_id)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    if item is None or not owner_matches_wallet(str(item.get("owner_id") or ""), session.wallet_id):
+        raise HTTPException(status_code=404, detail="instance not found")
+    return item
+
+
+def catalog_view(hub_service: MachineHubService, instance_id: str) -> RuntimeInstanceView:
+    try:
+        item = hub_service.catalog_instance(instance_id)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    if item is None:
+        raise HTTPException(status_code=404, detail="instance not found")
+    return RuntimeInstanceView.model_validate(item)
+
+
+async def dispatch_runtime_instance_action(
+    settings: Settings,
+    service: OpenClawRuntimeService,
+    instance_id: str,
+    action: str,
+    session: AuthSessionView,
+) -> RuntimeInstanceActionResponse:
+    if action not in {"start", "stop", "run"}:
+        raise HTTPException(status_code=404, detail="runtime action not found")
+    require_hub_catalog(settings)
+    hub_service = MachineHubService(settings.database_url)
+    current = require_owned_catalog_instance(hub_service, instance_id, session)
+    scheduled = current.get("deployment_mode") == "scheduled"
+    run_id: str | None = None
+    if action == "run":
+        if not scheduled:
+            raise HTTPException(status_code=409, detail="only scheduled instances can be run once on demand")
+        payload = HubRunOncePayloadV1(kind="run_once", run_id=uuid4(), trigger="manual", scheduled_for=datetime.now(UTC))
+        run_id = str(payload.run_id)
+        await dispatch_owned_instance_command(
+            settings,
+            service,
+            instance_id,
+            session,
+            HubCommandOperation.RUN_INSTANCE_ONCE,
+            operation_payload=payload,
+            timeout_seconds=min(payload.timeout_seconds, 300),
+            runtime_type=str(current["runtime_type"]),
+        )
+    else:
+        operation = HubCommandOperation.START_INSTANCE if action == "start" else HubCommandOperation.STOP_INSTANCE
+        await dispatch_owned_instance_command(
+            settings, service, instance_id, session, operation, runtime_type=str(current["runtime_type"])
+        )
+    if scheduled:
+        # For scheduled instances start/stop enable/disable the schedule; nothing is launched.
+        message = {"start": "schedule enabled", "stop": "schedule disabled", "run": "run completed by Machine Hub"}[action]
+    else:
+        message = f"{action} completed by Machine Hub"
+    return RuntimeInstanceActionResponse(
+        message=message,
+        instance=catalog_view(hub_service, instance_id),
+        run_id=run_id,
+    )
+
+
+async def dispatch_owned_instance_command(
+    settings: Settings,
+    service: OpenClawRuntimeService,
+    instance_id: str,
+    session: AuthSessionView,
+    operation: HubCommandOperation,
+    operation_payload: object | None = None,
+    timeout_seconds: int = 30,
+    runtime_type: str | None = None,
+) -> dict:
+    require_hub_catalog(settings)
+    hub_service = MachineHubService(settings.database_url)
+    catalog = require_owned_catalog_instance(hub_service, instance_id, session)
+    try:
+        hub_id = hub_service.instance_hub_id(instance_id)
+        if not hub_id:
+            raise HTTPException(status_code=404, detail="instance not found")
+        if not hub_service.is_online(hub_id):
+            raise HTTPException(status_code=503, detail="Machine Hub is offline")
+        command_request = HubCommandIssueRequestV1(
+            target_instance_id=instance_id,
+            runtime_type=runtime_type or str(catalog["runtime_type"]),
+            operation=operation,
+            idempotency_key=f"instance-command-{uuid4().hex}",
+            desired_revision=hub_service.next_desired_revision(hub_id, instance_id),
+            trace_id=f"instance-command-{uuid4().hex}",
+            expires_at=datetime.now(UTC) + timedelta(minutes=5),
+            operation_payload=operation_payload,
+        )
+        receipt = hub_service.issue_command(hub_id, command_request, actor=f"wallet:{session.wallet_id}")
+        command_id = receipt.command_id
+        deadline = asyncio.get_running_loop().time() + timeout_seconds
+        while asyncio.get_running_loop().time() < deadline:
+            command = hub_service.command_status(hub_id, str(command_id))
+            if command is None:
+                raise HTTPException(status_code=502, detail="Hub command disappeared before completion")
+            status = command["status"]
+            if status == "succeeded":
+                return command
+            if status in {"failed", "rejected", "unknown", "expired", "superseded"}:
+                error_code = command["result"].get("error_code") or status.upper()
+                status_code = (
+                    409 if status != "failed" or error_code == "INSTANCE_RUNNING"
+                    else 400 if error_code in {"INVALID_ARGUMENT", "INVALID_MODEL"}
+                    else 502
+                )
+                raise HTTPException(status_code=status_code, detail=f"Hub command {status}: {error_code}")
+            await asyncio.sleep(0.2)
+        raise HTTPException(
+            status_code=504,
+            detail=f"Hub command is still pending; command_id={command_id}",
+        )
+    except HTTPException:
+        raise
+    except HubNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except HubConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
 def openclaw_runtime_service(settings: Settings) -> OpenClawRuntimeService:
     from orchestrator.services.openclaw import OpenClawRuntimeConfig
 
@@ -104,26 +283,6 @@ def openclaw_runtime_service(settings: Settings) -> OpenClawRuntimeService:
     )
 
 
-def runtime_instance_view(instance: BotInstanceView) -> RuntimeInstanceView:
-    capabilities = ["start", "stop", "logs", "diagnose"]
-    if instance.kind == "whatsapp":
-        capabilities.append("channel-pairing")
-    return RuntimeInstanceView(
-        id=instance.id,
-        name=instance.name or instance.id,
-        runtime_type="openclaw",
-        workload_type=instance.kind,
-        model=instance.model,
-        desired_state=instance.desired_state,
-        observed_state=instance.status,
-        owner_wallet=instance.owner_wallet,
-        endpoint=f"http://127.0.0.1:{instance.port}",
-        process_id=instance.pid,
-        last_error=instance.last_error,
-        created_at=instance.created_at,
-        updated_at=instance.updated_at,
-        capabilities=capabilities,
-    )
 def workspace_adapter_for_agent(settings: Settings, agent_key: str) -> AgentWorkspaceAdapter:
     if agent_key == "messenger":
         from orchestrator.adapters.messenger import MessengerWorkspaceAdapter
@@ -176,12 +335,17 @@ async def public_runtime_providers(request: Request) -> RuntimeProviderListRespo
 @router.get("/runtime/instances", response_model=RuntimeInstanceListResponse)
 async def public_runtime_instances(request: Request) -> RuntimeInstanceListResponse:
     session = require_session(request)
-    service = openclaw_runtime_service(Settings())
-    instances = [
-        item for item in service.list_instances().items
-        if owner_matches_wallet(item.owner_wallet, session.wallet_id)
+    settings = Settings()
+    require_hub_catalog(settings)
+    try:
+        catalog = MachineHubService(settings.database_url).list_catalog_instances()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    items = [
+        RuntimeInstanceView.model_validate(item)
+        for item in catalog
+        if owner_matches_wallet(str(item.get("owner_id") or ""), session.wallet_id)
     ]
-    items = [runtime_instance_view(item) for item in instances]
     return RuntimeInstanceListResponse(
         items=items,
         total=len(items),
@@ -191,18 +355,34 @@ async def public_runtime_instances(request: Request) -> RuntimeInstanceListRespo
     )
 
 
+@router.get("/runtime/hubs", response_model=RuntimeHubListResponse)
+async def public_runtime_hubs(request: Request) -> RuntimeHubListResponse:
+    session = require_session(request)
+    settings = Settings()
+    require_hub_catalog(settings)
+    hubs = MachineHubService(settings.database_url).list_runtime_hubs(owner_id=session.wallet_id)
+    items = [RuntimeHubView.model_validate(item) for item in hubs]
+    return RuntimeHubListResponse(
+        items=items,
+        total=len(items),
+        online=sum(1 for item in items if item.status == "online"),
+        offline=sum(1 for item in items if item.status == "offline"),
+        unknown=sum(1 for item in items if item.status not in {"online", "offline"}),
+    )
+
+
 @router.post("/runtime/instances", response_model=RuntimeInstanceView)
 async def public_create_runtime_instance(
     payload: RuntimeInstanceCreateRequest,
     request: Request,
 ) -> RuntimeInstanceView:
-    if payload.runtime_type != "openclaw":
-        raise HTTPException(status_code=400, detail="runtime_type is not supported")
     settings = Settings()
     session = require_session(request)
-    service = openclaw_runtime_service(settings)
-    try:
-        instance = service.create_instance(
+    require_hub_catalog(settings)
+    hub_service = MachineHubService(settings.database_url)
+    if payload.runtime_type == "openclaw":
+        instance = await create_openclaw_instance_via_hub(
+            settings,
             BotInstanceCreateRequest(
                 kind=payload.kind,
                 name=payload.name,
@@ -210,12 +390,182 @@ async def public_create_runtime_instance(
                 template=payload.template,
                 dingtalk_client_id=payload.dingtalk_client_id,
                 dingtalk_client_secret=payload.dingtalk_client_secret,
+                deployment_mode=payload.deployment_mode,
+                schedule=payload.schedule,
             ),
-            owner_wallet=session.wallet_id,
+            session,
+            target_hub_id=payload.target_hub_id,
         )
-        return runtime_instance_view(instance)
+        return catalog_view(hub_service, instance.id)
+    if payload.runtime_type in CLI_RUNTIME_TYPES:
+        instance_id = await create_cli_task_instance_via_hub(settings, payload, session)
+        return catalog_view(hub_service, instance_id)
+    raise HTTPException(status_code=400, detail="runtime_type is not supported")
+
+
+async def _await_hub_command(hub_service: MachineHubService, hub_id: str, command_id: str, label: str, timeout_seconds: float = 30) -> dict:
+    deadline = asyncio.get_running_loop().time() + timeout_seconds
+    while asyncio.get_running_loop().time() < deadline:
+        command = hub_service.command_status(hub_id, command_id)
+        if command is None:
+            raise HTTPException(status_code=502, detail=f"Hub {label} command disappeared before completion")
+        if command["status"] == "succeeded":
+            return command
+        if command["status"] in {"failed", "rejected", "unknown", "expired", "superseded"}:
+            error_code = command["result"].get("error_code") or command["status"].upper()
+            raise HTTPException(status_code=502, detail=f"Hub {label} command {command['status']}: {error_code}")
+        await asyncio.sleep(0.2)
+    raise HTTPException(status_code=504, detail=f"Hub {label} command is still pending; command_id={command_id}")
+
+
+async def create_cli_task_instance_via_hub(
+    settings: Settings,
+    payload: RuntimeInstanceCreateRequest,
+    session: AuthSessionView,
+) -> str:
+    """Create a scheduled Codex / Claude Code task on the target Hub; returns the catalog instance id."""
+    if not settings.database_url:
+        raise HTTPException(status_code=503, detail="Machine Hub is not configured for this Backend")
+    assert payload.task is not None and payload.schedule is not None
+    hub_service = MachineHubService(settings.database_url)
+    try:
+        target_hub_id = hub_service.select_placement_hub(payload.runtime_type, payload.target_hub_id)
+        encrypted_secret = None
+        if payload.task.model_api_key:
+            hub_encryption_key = settings.parsed_hub_command_encryption_keys.get(target_hub_id)
+            if not hub_encryption_key:
+                raise HTTPException(
+                    status_code=503,
+                    detail=f"HUB_COMMAND_ENCRYPTION_KEYS has no key for Hub '{target_hub_id}'",
+                )
+            try:
+                cipher = Fernet(hub_encryption_key.encode("ascii"))
+            except (ValueError, UnicodeError) as exc:
+                raise HTTPException(status_code=503, detail="HUB_COMMAND_ENCRYPTION_KEY is invalid") from exc
+            encrypted_secret = cipher.encrypt(payload.task.model_api_key.encode("utf-8")).decode("ascii")
+        instance_id = f"{payload.runtime_type}-{uuid4().hex}"
+        command_request = HubCommandIssueRequestV1(
+            target_instance_id=instance_id,
+            runtime_type=payload.runtime_type,
+            operation=HubCommandOperation.CREATE_INSTANCE,
+            idempotency_key=f"runtime-create-{uuid4().hex}",
+            desired_revision=1,
+            trace_id=f"runtime-create-{uuid4().hex}",
+            expires_at=datetime.now(UTC) + timedelta(minutes=2),
+            create_payload=HubCliTaskCreatePayloadV1(
+                kind="cli_task",
+                name=payload.name,
+                prompt=payload.task.prompt,
+                model=payload.model,
+                codex_sandbox=payload.task.codex_sandbox,
+                claude_permission_mode=payload.task.claude_permission_mode,
+                run_timeout_seconds=payload.task.run_timeout_seconds,
+                schedule=HubInstanceScheduleV1.model_validate(payload.schedule.model_dump(mode="json")),
+                model_api_key_envelope=encrypted_secret,
+            ),
+        )
+        receipt = hub_service.issue_command(
+            target_hub_id,
+            command_request,
+            actor=f"wallet:{session.wallet_id}",
+            catalog_owner_id=session.wallet_id,
+        )
+        await _await_hub_command(hub_service, target_hub_id, str(receipt.command_id), "create")
+        return instance_id
+    except HTTPException:
+        raise
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except HubNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except HubConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+async def create_openclaw_instance_via_hub(
+    settings: Settings,
+    payload: BotInstanceCreateRequest,
+    session: AuthSessionView,
+    target_hub_id: str | None = None,
+) -> BotInstanceView:
+    service = openclaw_runtime_service(settings)
+    if not settings.database_url:
+        raise HTTPException(status_code=503, detail="Machine Hub is not configured for this Backend")
+    try:
+        hub_service = MachineHubService(settings.database_url)
+        hub_id = hub_service.select_placement_hub("openclaw", target_hub_id)
+        encrypted_secret = None
+        if payload.dingtalk_client_secret:
+            hub_encryption_key = settings.parsed_hub_command_encryption_keys.get(hub_id)
+            if not hub_encryption_key:
+                raise HTTPException(
+                    status_code=503,
+                    detail=f"HUB_COMMAND_ENCRYPTION_KEYS has no key for Hub '{hub_id}'",
+                )
+            try:
+                cipher = Fernet(hub_encryption_key.encode("ascii"))
+            except (ValueError, UnicodeError) as exc:
+                raise HTTPException(status_code=503, detail="HUB_COMMAND_ENCRYPTION_KEY is invalid") from exc
+            encrypted_secret = cipher.encrypt(payload.dingtalk_client_secret.encode("utf-8")).decode("ascii")
+        instance_id = f"openclaw-{uuid4().hex}"
+        command_request = HubCommandIssueRequestV1(
+            target_instance_id=instance_id,
+            runtime_type="openclaw",
+            operation=HubCommandOperation.CREATE_INSTANCE,
+            idempotency_key=f"runtime-create-{uuid4().hex}",
+            desired_revision=1,
+            trace_id=f"runtime-create-{uuid4().hex}",
+            expires_at=datetime.now(UTC) + timedelta(minutes=2),
+            create_payload=HubOpenClawCreatePayloadV1(
+                kind=payload.kind,
+                name=payload.name,
+                model=payload.model,
+                template=payload.template,
+                dingtalk_client_id=payload.dingtalk_client_id,
+                dingtalk_client_secret_envelope=encrypted_secret,
+                deployment_mode=payload.deployment_mode,
+                schedule=(
+                    HubInstanceScheduleV1.model_validate(payload.schedule.model_dump(mode="json"))
+                    if payload.schedule
+                    else None
+                ),
+            ),
+        )
+        receipt = hub_service.issue_command(
+            hub_id,
+            command_request,
+            actor=f"wallet:{session.wallet_id}",
+            catalog_owner_id=session.wallet_id,
+        )
+        deadline = asyncio.get_running_loop().time() + 30
+        while asyncio.get_running_loop().time() < deadline:
+            command = hub_service.command_status(hub_id, str(receipt.command_id))
+            if command is None:
+                raise HTTPException(status_code=502, detail="Hub create command disappeared before completion")
+            if command["status"] == "succeeded":
+                catalog_deadline = asyncio.get_running_loop().time() + 2
+                instance = None
+                while asyncio.get_running_loop().time() < catalog_deadline:
+                    instance = service.get_instance(instance_id)
+                    if instance is not None and instance.port > 0:
+                        break
+                    await asyncio.sleep(0.05)
+                if instance is None or instance.port <= 0:
+                    raise HTTPException(status_code=502, detail="Hub created an instance without reporting its port")
+                return instance
+            if command["status"] in {"failed", "rejected", "unknown", "expired", "superseded"}:
+                error_code = command["result"].get("error_code") or command["status"].upper()
+                raise HTTPException(status_code=502, detail=f"Hub create command {command['status']}: {error_code}")
+            await asyncio.sleep(0.2)
+        raise HTTPException(status_code=504, detail=f"Hub create command is still pending; command_id={receipt.command_id}")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except HubNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except HubConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
@@ -230,21 +580,27 @@ async def public_runtime_instance_action(
     settings = Settings()
     service = openclaw_runtime_service(settings)
     try:
-        require_owned_instance(service, instance_id, session)
-        if action == "start":
-            result = service.start_instance(instance_id)
-        elif action == "stop":
-            result = service.stop_instance(instance_id)
-        else:
-            raise HTTPException(status_code=404, detail="runtime action not found")
+        return await dispatch_runtime_instance_action(settings, service, instance_id, action, session)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=exc.args[0]) from exc
+
+
+@router.get("/runtime/instances/{instance_id}/runs", response_model=ScheduledRunListResponse)
+async def public_runtime_instance_runs(
+    instance_id: str,
+    request: Request,
+    limit: int = Query(default=50, ge=1, le=200),
+) -> ScheduledRunListResponse:
+    session = require_session(request)
+    settings = Settings()
+    require_hub_catalog(settings)
+    hub_service = MachineHubService(settings.database_url)
+    require_owned_catalog_instance(hub_service, instance_id, session)
+    try:
+        items = hub_service.list_scheduled_runs(instance_id, limit)
     except RuntimeError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
-    return RuntimeInstanceActionResponse(
-        message=result.message,
-        instance=runtime_instance_view(result.instance),
-    )
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return ScheduledRunListResponse(items=[ScheduledRunView(**item) for item in items], total=len(items))
 
 
 @router.get("/auth/me", response_model=AuthSessionView)
@@ -299,6 +655,85 @@ async def public_auth_logout(response: Response) -> dict[str, bool]:
     return {"ok": True}
 
 
+@router.post("/auth/identity/login/session", response_model=IdentityLoginSessionEnvelope)
+async def public_auth_identity_login_session(request: Request, avatar: int = Query(default=1)) -> dict[str, object]:
+    settings = Settings()
+    service = auth_service(settings)
+    base_url = service.resolve_base_url(request).rstrip("/")
+    parsed = urlparse(base_url)
+    audience = f"{parsed.scheme}://{parsed.netloc}"
+    try:
+        return {"code": 0, "message": "ok", "data": identity_auth_service(settings).create_wallet_session(audience, avatar=avatar == 1)}
+    except ValueError as exc:
+        return JSONResponse(status_code=503, content={"code": 1, "message": str(exc)})
+
+
+@router.post("/auth/identity/login/verify", response_model=IdentityLoginResultEnvelope)
+async def public_auth_identity_login_verify(payload: dict[str, object], request: Request, response: Response) -> dict[str, object]:
+    settings = Settings()
+    identity = identity_auth_service(settings)
+    session_id = str(payload.get("session_id", "")).strip()
+    presentation = payload.get("presentation")
+    if not session_id or not isinstance(presentation, dict):
+        return JSONResponse(status_code=400, content={"code": 1, "message": "登录参数无效"})
+    try:
+        session, did = identity.verify_wallet_session(session_id, presentation)
+    except ValueError as exc:
+        return JSONResponse(status_code=401, content={"code": 1, "message": str(exc)})
+    token = auth_service(settings).encode_session(session)
+    set_identity_session_cookie(response, settings, request, token)
+    return {"code": 0, "message": "ok", "data": {
+        "token": token, "did": did, "walletAddress": session.wallet_id, "wallet_address": session.wallet_id,
+        "username": session.username, "expires_at": session.expires_at, "auth_type": session.auth_type,
+        "auth_method": session.auth_method,
+    }}
+
+
+@router.post("/auth/passport/sessions")
+async def public_auth_passport_session(request: Request) -> dict[str, object]:
+    settings = Settings()
+    callback = settings.identity_redirect_uri or auth_service(settings).resolve_base_url(request).rstrip("/") + "/api/v1/public/auth/passport/callback"
+    try:
+        return identity_auth_service(settings).create_passkey_session(callback)
+    except ValueError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+@router.get("/auth/passport/sessions/{session_id}")
+async def public_auth_passport_status(session_id: str, request: Request, response: Response) -> dict[str, object]:
+    settings = Settings()
+    try:
+        payload, session = identity_auth_service(settings).poll_passkey_session(session_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if payload.get("status") == "completed" and session is not None:
+        token = auth_service(settings).encode_session(session)
+        set_identity_session_cookie(response, settings, request, token)
+    return payload
+
+
+@router.delete("/auth/passport/sessions/{session_id}")
+async def public_auth_passport_cancel(session_id: str) -> dict[str, str]:
+    try:
+        status = identity_auth_service(Settings()).cancel_passkey_session(session_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return {"status": status}
+
+
+@router.get("/auth/passport/callback")
+async def public_auth_passport_callback(code: str, state: str) -> Response:
+    settings = Settings()
+    try:
+        identity_auth_service(settings).callback(state, code)
+    except ValueError as exc:
+        raise HTTPException(status_code=410, detail=str(exc)) from exc
+    return Response(
+        content="<!doctype html><html><meta charset='utf-8'><title>登录已确认</title><body>登录已确认，请返回应用。<script>try{window.close()}catch(e){}</script></body></html>",
+        media_type="text/html",
+    )
+
+
 @router.get("/agents", response_model=AgentListResponse)
 @router.get("/robots", response_model=AgentListResponse, include_in_schema=False)
 async def public_agents(request: Request) -> AgentListResponse:
@@ -332,6 +767,7 @@ async def public_router_models(request: Request) -> RouterModelsResponse:
 async def public_bot_instances(request: Request) -> BotInstanceListResponse:
     session = require_session(request)
     settings = Settings()
+    require_hub_catalog(settings)
     service = openclaw_runtime_service(settings)
     listing = service.list_instances()
     listing.items = [item for item in listing.items if owner_matches_wallet(item.owner_wallet, session.wallet_id)]
@@ -342,14 +778,8 @@ async def public_bot_instances(request: Request) -> BotInstanceListResponse:
 @router.post("/robot/instances", response_model=BotInstanceView, include_in_schema=False)
 async def public_create_bot_instance(payload: BotInstanceCreateRequest, request: Request) -> BotInstanceView:
     settings = Settings()
-    service = openclaw_runtime_service(settings)
     session = require_session(request)
-    try:
-        return service.create_instance(payload, owner_wallet=session.wallet_id)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except RuntimeError as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return await create_openclaw_instance_via_hub(settings, payload, session)
 
 
 @router.get("/agent/instances/{instance_id}", response_model=BotInstanceView)
@@ -357,6 +787,7 @@ async def public_create_bot_instance(payload: BotInstanceCreateRequest, request:
 async def public_bot_instance(instance_id: str, request: Request) -> BotInstanceView:
     session = require_session(request)
     settings = Settings()
+    require_hub_catalog(settings)
     service = openclaw_runtime_service(settings)
     _db, raw = require_owned_instance(service, instance_id, session)
     return service._view_from_raw(instance_id, raw)
@@ -368,15 +799,15 @@ async def public_delete_bot_instance(instance_id: str, request: Request) -> dict
     session = require_session(request)
     settings = Settings()
     service = openclaw_runtime_service(settings)
-    try:
-        require_owned_instance(service, instance_id, session)
-        return service.delete_instance(instance_id)
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail=exc.args[0]) from exc
-    except RuntimeError as exc:
-        message = str(exc)
-        status_code = 409 if "stop it before delete" in message else 502
-        raise HTTPException(status_code=status_code, detail=message) from exc
+    command = await dispatch_owned_instance_command(
+        settings,
+        service,
+        instance_id,
+        session,
+        HubCommandOperation.DELETE_INSTANCE,
+    )
+    result = command["result"].get("result") or {}
+    return {"message": "deleted", "id": result.get("instance_id", instance_id), "archived": {}}
 
 
 @router.patch("/agent/instances/{instance_id}/model", response_model=BotInstanceView)
@@ -389,15 +820,23 @@ async def public_patch_bot_instance_model(
     session = require_session(request)
     settings = Settings()
     service = openclaw_runtime_service(settings)
-    try:
-        require_owned_instance(service, instance_id, session)
-        return service.update_instance_model(instance_id, payload.model)
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail=exc.args[0]) from exc
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except RuntimeError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    selected_model = payload.model.strip()
+    if not selected_model:
+        raise HTTPException(status_code=400, detail="model is required")
+    if settings.parsed_model_allowlist and selected_model not in settings.parsed_model_allowlist:
+        raise HTTPException(status_code=400, detail=f"model '{selected_model}' not in allowlist")
+    await dispatch_owned_instance_command(
+        settings,
+        service,
+        instance_id,
+        session,
+        HubCommandOperation.UPDATE_INSTANCE_MODEL,
+        HubOpenClawModelPayloadV1(kind="update_model", model=selected_model),
+    )
+    instance = service.get_instance(instance_id)
+    if instance is None:
+        raise HTTPException(status_code=404, detail="instance not found")
+    return instance
 
 
 @router.get("/runtime/instances/{instance_id}/logs", response_model=BotInstanceLogsResponse)
@@ -406,16 +845,22 @@ async def public_patch_bot_instance_model(
 async def public_bot_instance_logs(
     instance_id: str,
     request: Request,
-    lines: int = 120,
+    lines: int = Query(default=120, ge=1, le=1000),
 ) -> BotInstanceLogsResponse:
     session = require_session(request)
     settings = Settings()
     service = openclaw_runtime_service(settings)
-    require_owned_instance(service, instance_id, session)
-    logs = service.get_instance_logs(instance_id, lines=lines)
-    if logs is None:
-        raise HTTPException(status_code=404, detail="instance not found")
-    return logs
+    command = await dispatch_owned_instance_command(
+        settings,
+        service,
+        instance_id,
+        session,
+        HubCommandOperation.GET_INSTANCE_LOGS,
+        HubOpenClawLogsPayloadV1(kind="get_logs", lines=lines),
+        timeout_seconds=20,
+    )
+    result = command["result"].get("result") or {}
+    return BotInstanceLogsResponse.model_validate({key: value for key, value in result.items() if key != "kind"})
 
 
 @router.get("/runtime/instances/{instance_id}/diagnose", response_model=BotInstanceDiagnoseResponse)
@@ -429,13 +874,19 @@ async def public_bot_instance_diagnose(
     session = require_session(request)
     settings = Settings()
     service = openclaw_runtime_service(settings)
-    try:
-        require_owned_instance(service, instance_id, session)
-        return service.diagnose_instance(instance_id, auto_recover=auto_recover)
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail=exc.args[0]) from exc
-    except RuntimeError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    command = await dispatch_owned_instance_command(
+        settings,
+        service,
+        instance_id,
+        session,
+        HubCommandOperation.DIAGNOSE_INSTANCE,
+        HubOpenClawDiagnosePayloadV1(kind="diagnose", auto_recover=auto_recover),
+        timeout_seconds=60,
+    )
+    result = dict(command["result"].get("result") or {})
+    result.pop("kind", None)
+    result["kind"] = result.pop("workload_type", "")
+    return BotInstanceDiagnoseResponse.model_validate(result)
 
 
 @router.post("/agent/instances/{instance_id}/start", response_model=BotInstanceActionResponse)
@@ -445,8 +896,11 @@ async def public_start_bot_instance(instance_id: str, request: Request) -> BotIn
     settings = Settings()
     service = openclaw_runtime_service(settings)
     try:
-        require_owned_instance(service, instance_id, session)
-        return service.start_instance(instance_id)
+        action = await dispatch_runtime_instance_action(settings, service, instance_id, "start", session)
+        instance = service.get_instance(instance_id)
+        if instance is None:
+            raise HTTPException(status_code=404, detail="instance not found")
+        return BotInstanceActionResponse(message=action.message, instance=instance)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=exc.args[0]) from exc
     except RuntimeError as exc:
@@ -460,8 +914,11 @@ async def public_stop_bot_instance(instance_id: str, request: Request) -> BotIns
     settings = Settings()
     service = openclaw_runtime_service(settings)
     try:
-        require_owned_instance(service, instance_id, session)
-        return service.stop_instance(instance_id)
+        action = await dispatch_runtime_instance_action(settings, service, instance_id, "stop", session)
+        instance = service.get_instance(instance_id)
+        if instance is None:
+            raise HTTPException(status_code=404, detail="instance not found")
+        return BotInstanceActionResponse(message=action.message, instance=instance)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=exc.args[0]) from exc
     except RuntimeError as exc:
@@ -473,16 +930,25 @@ async def public_stop_bot_instance(instance_id: str, request: Request) -> BotIns
 async def public_pair_whatsapp(instance_id: str, request: Request) -> BotInstancePairResponse:
     session = require_session(request)
     settings = Settings()
+    require_hub_catalog(settings)
     service = openclaw_runtime_service(settings)
-    try:
-        require_owned_instance(service, instance_id, session)
-        return service.pair_whatsapp(instance_id)
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail=exc.args[0]) from exc
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except RuntimeError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    _record, raw = require_owned_instance(service, instance_id, session)
+    if raw.get("kind") != "whatsapp":
+        raise HTTPException(status_code=400, detail="pair-whatsapp is only valid for whatsapp instance")
+    command = await dispatch_owned_instance_command(
+        settings,
+        service,
+        instance_id,
+        session,
+        HubCommandOperation.PAIR_WHATSAPP,
+        timeout_seconds=20,
+    )
+    result = command["result"].get("result") or {}
+    return BotInstancePairResponse(
+        message=result.get("message", ""),
+        pair_pid=result.get("pair_pid", 0),
+        pair_log=result.get("pair_log", ""),
+    )
 
 
 @router.get("/agents/{agent_key}/summary", response_model=AgentWorkspaceSummaryResponse)

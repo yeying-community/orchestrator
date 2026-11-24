@@ -1,6 +1,8 @@
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from pydantic import BaseModel, Field, field_validator
+from croniter import croniter
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class HealthResponse(BaseModel):
@@ -29,6 +31,41 @@ class AuthChallengeView(BaseModel):
     expires_at: str
 
 
+class IdentityLoginSessionView(BaseModel):
+    session_id: str
+    request_id: str | None = None
+    nonce: str | None = None
+    audience: str | None = None
+    scopes: list[str] = Field(default_factory=list)
+    verify_url: str | None = None
+    expires_at: str
+    poll_interval: int = 2
+
+
+class IdentityLoginSessionEnvelope(BaseModel):
+    code: int = 0
+    message: str = "ok"
+    data: IdentityLoginSessionView
+
+
+class IdentityLoginResult(BaseModel):
+    token: str
+    did: str
+    walletAddress: str | None = None
+    wallet_address: str | None = None
+    username: str | None = None
+    expires_at: str
+    refresh_expires_at: str | None = None
+    auth_type: str = "wallet_identity"
+    auth_method: str | None = None
+
+
+class IdentityLoginResultEnvelope(BaseModel):
+    code: int = 0
+    message: str = "ok"
+    data: IdentityLoginResult
+
+
 class AuthSessionVerifyRequest(BaseModel):
     wallet_id: str
     chain_id: str | None = None
@@ -43,6 +80,9 @@ class AuthSessionView(BaseModel):
     wallet_id: str
     chain_id: str | None = None
     auth_type: str = "wallet_plugin"
+    auth_method: str | None = None
+    did: str | None = None
+    username: str | None = None
     issued_at: str
     expires_at: str
     ucan_session: dict[str, Any] | list[Any] | str | int | float | bool | None = None
@@ -138,6 +178,32 @@ class AgentTypesResponse(BaseModel):
     agentTypes: list[AgentTypeItem]
 
 
+class InstanceSchedule(BaseModel):
+    """Schedule for a `scheduled` instance. Validated at the API edge; the Hub triggers it locally."""
+
+    kind: Literal["cron", "interval"]
+    expr: str | None = Field(default=None, min_length=1, max_length=128)
+    seconds: int | None = Field(default=None, ge=60, le=31_536_000)
+    timezone: str | None = Field(default=None, min_length=1, max_length=64)
+
+    @model_validator(mode="after")
+    def validate_definition(self) -> "InstanceSchedule":
+        if self.kind == "cron":
+            if self.expr is None or self.seconds is not None:
+                raise ValueError("cron schedule requires expr and must not set seconds")
+            if not croniter.is_valid(self.expr):
+                raise ValueError(f"invalid cron expression: {self.expr!r}")
+        else:
+            if self.seconds is None or self.expr is not None:
+                raise ValueError("interval schedule requires seconds and must not set expr")
+        if self.timezone is not None:
+            try:
+                ZoneInfo(self.timezone)
+            except (ZoneInfoNotFoundError, ValueError) as exc:
+                raise ValueError(f"unknown timezone: {self.timezone!r}") from exc
+        return self
+
+
 class BotInstanceView(BaseModel):
     id: str
     kind: str
@@ -155,6 +221,8 @@ class BotInstanceView(BaseModel):
     logs_dir: str
     last_error: str | None
     dingtalk_client_id: str | None = None
+    deployment_mode: Literal["service", "scheduled"] = "service"
+    schedule: InstanceSchedule | None = None
 
 
 class BotInstanceListResponse(BaseModel):
@@ -182,6 +250,16 @@ class BotInstanceCreateRequest(BaseModel):
     template: str | None = None
     dingtalk_client_id: str | None = None
     dingtalk_client_secret: str | None = None
+    deployment_mode: Literal["service", "scheduled"] = "service"
+    schedule: InstanceSchedule | None = None
+
+    @model_validator(mode="after")
+    def validate_schedule_matches_mode(self) -> "BotInstanceCreateRequest":
+        if self.deployment_mode == "scheduled" and self.schedule is None:
+            raise ValueError("scheduled instances require a schedule")
+        if self.deployment_mode == "service" and self.schedule is not None:
+            raise ValueError("service instances must not define a schedule")
+        return self
 
 
 class RuntimeProviderView(BaseModel):
@@ -191,10 +269,30 @@ class RuntimeProviderView(BaseModel):
     management_mode: str
     availability: str
     capabilities: list[str]
+    # Hubs that reported this runtime adapter and can therefore host it.
+    hub_ids: list[str] = []
 
 
 class RuntimeProviderListResponse(BaseModel):
     items: list[RuntimeProviderView]
+
+
+class CliTaskSpec(BaseModel):
+    """Definition of a one-shot CLI agent task; the prompt is fixed per instance, never per run."""
+
+    prompt: str = Field(min_length=1, max_length=8192)
+    codex_sandbox: Literal["read-only", "workspace-write"] | None = None
+    claude_permission_mode: Literal["plan", "acceptEdits", "dontAsk"] | None = None
+    run_timeout_seconds: int = Field(default=900, ge=30, le=86_400)
+    # Plaintext model-provider credential; encrypted to the target Hub before it leaves the Backend.
+    model_api_key: str | None = Field(default=None, min_length=1, max_length=1024)
+
+
+class CliTaskView(BaseModel):
+    prompt: str
+    policy: str | None
+    run_timeout_seconds: int
+    model_credential_configured: bool = False
 
 
 class RuntimeInstanceView(BaseModel):
@@ -212,6 +310,28 @@ class RuntimeInstanceView(BaseModel):
     created_at: str
     updated_at: str
     capabilities: list[str]
+    deployment_mode: Literal["service", "scheduled"] = "service"
+    schedule: InstanceSchedule | None = None
+    # True once the catalog holds at least one run for this instance.
+    schedule_executed: bool = False
+    latest_run_state: str | None = None
+    latest_run_at: str | None = None
+    task: CliTaskView | None = None
+    hub_id: str | None = None
+    hub_status: str = "unknown"
+    hub_last_seen_at: str | None = None
+    latest_command_status: str | None = None
+    latest_command_operation: str | None = None
+    latest_command_updated_at: str | None = None
+
+
+class RuntimeHubView(BaseModel):
+    id: str
+    status: str
+    last_seen_at: str | None
+    adapter_count: int
+    instance_count: int
+    runtime_types: list[str] = []
 
 
 class RuntimeInstanceListResponse(BaseModel):
@@ -222,13 +342,62 @@ class RuntimeInstanceListResponse(BaseModel):
     attention: int
 
 
+class RuntimeHubListResponse(BaseModel):
+    items: list[RuntimeHubView]
+    total: int
+    online: int
+    offline: int
+    unknown: int
+
+
 class RuntimeInstanceActionResponse(BaseModel):
     message: str
     instance: RuntimeInstanceView
+    run_id: str | None = None
 
 
 class RuntimeInstanceCreateRequest(BotInstanceCreateRequest):
     runtime_type: str = "openclaw"
+    task: CliTaskSpec | None = None
+    # Target machine for placement; when several Hubs can run this runtime it must be set.
+    target_hub_id: str | None = None
+
+    @model_validator(mode="after")
+    def validate_runtime_shape(self) -> "RuntimeInstanceCreateRequest":
+        if self.runtime_type in {"codex", "claude-code"}:
+            if self.task is None:
+                raise ValueError("CLI task runtimes require a task definition")
+            if self.kind != "cli_task":
+                raise ValueError("CLI task instances use kind=cli_task")
+            if self.deployment_mode != "scheduled":
+                raise ValueError("CLI task instances are always scheduled")
+            if self.runtime_type == "codex" and self.task.claude_permission_mode is not None:
+                raise ValueError("claude_permission_mode does not apply to the codex runtime")
+            if self.runtime_type == "claude-code" and self.task.codex_sandbox is not None:
+                raise ValueError("codex_sandbox does not apply to the claude-code runtime")
+            if self.dingtalk_client_id or self.dingtalk_client_secret or self.template:
+                raise ValueError("messenger fields do not apply to CLI task runtimes")
+        elif self.task is not None:
+            raise ValueError("task definitions apply only to CLI task runtimes")
+        return self
+
+
+class ScheduledRunView(BaseModel):
+    id: str
+    instance_id: str
+    trigger: Literal["schedule", "manual"]
+    scheduled_for: str
+    started_at: str | None
+    finished_at: str | None
+    state: Literal["queued", "running", "succeeded", "failed", "cancelled", "unknown"]
+    exit_code: int | None
+    log_ref: str | None
+    command_id: str | None
+
+
+class ScheduledRunListResponse(BaseModel):
+    items: list[ScheduledRunView]
+    total: int
 
 
 class RuntimeNodeProviderReport(BaseModel):

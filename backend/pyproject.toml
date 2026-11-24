@@ -16,6 +16,7 @@ dependencies = [
   "SQLAlchemy>=2.0.41,<3.0.0",
   "alembic>=1.16.2,<2.0.0",
   "psycopg[binary]>=3.2.9,<4.0.0",
+  "croniter>=6.0.0,<7.0.0",
 ]
 
 [project.scripts]
@@ -24,6 +25,7 @@ orchestrator-import-runtime-json = "orchestrator.migrate_runtime_json:main"
 orchestrator-init-db = "orchestrator.init_db:main"
 orchestrator-outbox-worker = "orchestrator.outbox_worker:main"
 orchestrator-runtime-worker = "orchestrator.lifecycle_worker:main"
+orchestrator-machine-hub = "orchestrator.hub_client.cli:main"
 
 [build-system]
 requires = ["setuptools>=68", "wheel"]

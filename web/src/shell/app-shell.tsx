@@ -1,12 +1,12 @@
 import type { PropsWithChildren } from 'react'
-import { useEffect } from 'react'
-import { AppWindow, Boxes, CandlestickChart, LayoutDashboard, LogOut, MessageSquareMore } from 'lucide-react'
+import { useEffect, useRef, useState } from 'react'
+import { AppWindow, Boxes, CandlestickChart, Check, ChevronDown, Copy, LayoutDashboard, LogOut, MessageSquareMore, UserRound } from 'lucide-react'
 import { Link, useNavigate, useRouterState } from '@tanstack/react-router'
 
 import { logout } from '../platform/auth/mutations'
 import { usePlatformSession } from '../platform/auth/queries'
-import { Badge } from '../components/ui/badge'
-import { Button } from '../components/ui/button'
+import { useRuntimeHubs } from '../platform/agents/queries'
+import { queryClient } from '../platform/query/query-client'
 
 const navItems = [
   { to: '/overview', label: '运行概览', icon: LayoutDashboard, group: '控制面' },
@@ -20,10 +20,58 @@ function isActive(pathname: string, to: string) {
   return pathname === to || (to === '/agents/trader' && pathname.startsWith('/agents/trader/'))
 }
 
+function authMethodLabel(authMethod: string | null, authType: string | null) {
+  if (authMethod === 'passport') return '夜莺通行证'
+  if (authMethod === 'wallet_identity') return '钱包身份'
+  if (authType === 'wallet_identity') return '钱包身份'
+  if (authType === 'wallet_plugin') return '兼容钱包'
+  return '已验证身份'
+}
+
+function formatSessionExpiry(value: string | null) {
+  if (!value) return '未知'
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return '未知'
+  return new Intl.DateTimeFormat('zh-CN', {
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+  }).format(date)
+}
+
 export function AppShell({ children }: PropsWithChildren) {
   const pathname = useRouterState({ select: (state) => state.location.pathname })
   const navigate = useNavigate()
   const { session, isLoading } = usePlatformSession()
+  const hubsQuery = useRuntimeHubs()
+  const [accountOpen, setAccountOpen] = useState(false)
+  const [copiedWallet, setCopiedWallet] = useState(false)
+  const [accountError, setAccountError] = useState<string | null>(null)
+  const [isLoggingOut, setIsLoggingOut] = useState(false)
+  const accountRef = useRef<HTMLDivElement>(null)
+  const accountTriggerRef = useRef<HTMLButtonElement>(null)
+
+  const accountName = session.username || session.walletShort || '已登录用户'
+  const methodLabel = authMethodLabel(session.authMethod, session.authType)
+  const activePage = navItems.find((item) => isActive(pathname, item.to))?.label ?? '运行控制台'
+  const hubCount = hubsQuery.data?.items.length ?? 0
+  const onlineHubCount = hubsQuery.data?.online ?? 0
+  const hubStatus = hubsQuery.isLoading
+    ? '正在检查机器连接'
+    : hubsQuery.error
+      ? '机器状态暂不可用'
+      : onlineHubCount > 0
+        ? `${onlineHubCount} 台机器在线`
+        : hubCount > 0
+          ? '机器已离线'
+          : '尚未连接机器'
+  const hubStatusTone = hubsQuery.error || (!hubsQuery.isLoading && hubCount > 0 && onlineHubCount === 0)
+    ? 'attention'
+    : onlineHubCount > 0
+      ? 'healthy'
+      : 'quiet'
 
   useEffect(() => {
     if (!isLoading && !session.isAuthenticated) {
@@ -31,9 +79,55 @@ export function AppShell({ children }: PropsWithChildren) {
     }
   }, [isLoading, navigate, session])
 
+  useEffect(() => {
+    if (!accountOpen) return
+    function handlePointerDown(event: PointerEvent) {
+      if (!accountRef.current?.contains(event.target as Node)) setAccountOpen(false)
+    }
+    function handleKeyDown(event: KeyboardEvent) {
+      if (event.key === 'Escape') {
+        setAccountOpen(false)
+        accountTriggerRef.current?.focus()
+      }
+    }
+    document.addEventListener('pointerdown', handlePointerDown)
+    document.addEventListener('keydown', handleKeyDown)
+    return () => {
+      document.removeEventListener('pointerdown', handlePointerDown)
+      document.removeEventListener('keydown', handleKeyDown)
+    }
+  }, [accountOpen])
+
+  useEffect(() => {
+    setAccountOpen(false)
+    setAccountError(null)
+  }, [pathname])
+
+  async function handleCopyWallet() {
+    if (!session.walletId) return
+    try {
+      await navigator.clipboard.writeText(session.walletId)
+      setCopiedWallet(true)
+      setAccountError(null)
+      window.setTimeout(() => setCopiedWallet(false), 1800)
+    } catch {
+      setAccountError('无法访问剪贴板，请手动选择钱包地址复制。')
+    }
+  }
+
   async function handleLogout() {
-    await logout()
-    await navigate({ to: '/', replace: true })
+    setIsLoggingOut(true)
+    setAccountError(null)
+    try {
+      await logout()
+      queryClient.clear()
+      setAccountOpen(false)
+      await navigate({ to: '/', replace: true })
+    } catch (error) {
+      setAccountError(error instanceof Error ? error.message : '退出登录失败，请检查连接后重试。')
+    } finally {
+      setIsLoggingOut(false)
+    }
   }
 
   if (isLoading || !session.isAuthenticated) {
@@ -44,10 +138,10 @@ export function AppShell({ children }: PropsWithChildren) {
     <div className="app-frame">
       <aside className="app-sidebar">
         <Link to="/overview" className="brand-lockup" aria-label="Orchestrator 运行概览">
-          <div className="brand-mark">OR</div>
+          <div className="brand-mark" aria-hidden="true">OR</div>
           <div>
             <div className="brand-name">Orchestrator</div>
-            <div className="brand-caption">Runtime Control Plane</div>
+            <div className="brand-caption">运行时编排控制面</div>
           </div>
         </Link>
         <nav className="primary-nav" aria-label="主导航">
@@ -67,20 +161,81 @@ export function AppShell({ children }: PropsWithChildren) {
             </div>
           ))}
         </nav>
-        <div className="sidebar-footnote"><span className="node-indicator" />本地执行节点</div>
+        <div className={`sidebar-footnote sidebar-footnote-${hubStatusTone}`} title={hubStatus}>
+          <span className="node-indicator" aria-hidden="true" />
+          <span>{hubStatus}</span>
+        </div>
       </aside>
 
       <main className="app-main">
         <header className="topbar">
-          <div>
-            <div className="topbar-title">运行控制台</div>
-            <div className="topbar-subtitle">Agent runtimes and workloads</div>
+          <div className="topbar-context">
+            <div className="topbar-title">
+              <span className="topbar-console-label">运行控制台</span>
+              <span className="topbar-divider" aria-hidden="true">/</span>
+              <span className="topbar-current-page">{activePage}</span>
+            </div>
+            <div className="topbar-subtitle">管理机器连接、运行实例与应用工作负载</div>
           </div>
-          <div className="topbar-account">
-            <Badge variant="muted">{session.walletShort}</Badge>
-            <Button type="button" variant="outline" size="sm" aria-label="退出登录" title="退出登录" onClick={() => void handleLogout()}>
-              <LogOut className="h-4 w-4" />
-            </Button>
+          <div className="topbar-right">
+            <div className={`node-status node-status-${hubStatusTone}`} title={hubStatus} aria-label={hubStatus}>
+              <span className="node-indicator" aria-hidden="true" />
+              <span>{hubStatus}</span>
+            </div>
+            <div className="topbar-account" ref={accountRef}>
+            <button
+              ref={accountTriggerRef}
+              type="button"
+              className="account-trigger"
+              aria-label={`账户：${accountName}`}
+              aria-haspopup="dialog"
+              aria-expanded={accountOpen}
+              aria-controls={accountOpen ? 'account-popover' : undefined}
+              onClick={() => {
+                setAccountError(null)
+                setAccountOpen((open) => !open)
+              }}
+            >
+              <span className="account-avatar" aria-hidden="true">{Array.from(accountName)[0] || <UserRound className="h-4 w-4" />}</span>
+              <span className="account-trigger-copy">
+                <strong title={accountName}>{accountName}</strong>
+                <span>{methodLabel}</span>
+              </span>
+              <ChevronDown className="account-chevron h-4 w-4" aria-hidden="true" />
+            </button>
+            {accountOpen && (
+              <section className="account-popover" id="account-popover" role="dialog" aria-modal="false" aria-label="账户信息">
+                <div className="account-popover-heading">
+                  <span className="account-avatar account-avatar-large" aria-hidden="true">{Array.from(accountName)[0] || <UserRound className="h-5 w-5" />}</span>
+                  <div className="account-popover-name">
+                    <strong>{accountName}</strong>
+                    <span>{methodLabel} · 已验证</span>
+                  </div>
+                </div>
+                <div className="account-detail">
+                  <span>钱包地址</span>
+                  <div className="account-wallet-value">
+                    <code>{session.walletId || '未提供'}</code>
+                    {session.walletId && (
+                      <button type="button" className="account-copy-button" onClick={() => void handleCopyWallet()}>
+                        {copiedWallet ? <Check className="h-4 w-4" /> : <Copy className="h-4 w-4" />}
+                        {copiedWallet ? '已复制' : '复制地址'}
+                      </button>
+                    )}
+                  </div>
+                </div>
+                <div className="account-detail">
+                  <span>会话有效期至</span>
+                  <strong>{formatSessionExpiry(session.expiresAt)}</strong>
+                </div>
+                {accountError && <div className="account-error" role="alert">{accountError}</div>}
+                <button type="button" className="account-logout" onClick={() => void handleLogout()} disabled={isLoggingOut}>
+                  <LogOut className="h-4 w-4" />
+                  {isLoggingOut ? '正在退出…' : '退出登录'}
+                </button>
+              </section>
+            )}
+            </div>
           </div>
         </header>
         <nav className="mobile-nav" aria-label="主导航">

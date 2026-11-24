@@ -1,5 +1,7 @@
 # Agent Runtime Protocol
 
+> 本文描述 YeYing Project 到 Orchestrator 的社区应用安装/升级/卸载协议，以及对应的单节点生命周期 worker。文中现存 Runtime Node 心跳和 Node Runtime Agent 都属于这条应用部署链路，不等同于 Backend 与每台机器 Hub 之间的 Runtime 控制协议；Hub 的目标架构和协议边界见[Hub 架构 ADR](hub-architecture-adr.md)。两类任务可能最终由同一台机器上的 Hub 执行，但身份、命令模型和能力验收需分别定义。
+
 ## 1. 架构定位
 
 社区智能体、AI 应用和 MCP 工具的控制与制品流转边界如下：
@@ -114,6 +116,46 @@ worker 必须在 Node 中为 `NODE_RUNTIME_INSTANCE_ID` 配置对应 Agent 实�
 升级先部署新版本并探测声明的 loopback healthcheck；成功后更新本地 current manifest。失败时尝试恢复上一个本地已验签的 release 并再次做 healthcheck。Worker 租约失效或收到 SIGTERM 时会终止正在运行的 Docker Compose 命令；正常关停会把任务归还 pending，旧 worker 不能上报新结果。每个 worker 进程必须使用唯一 `HUB_WORKER_ID`，不配置时自动生成。当前执行器是单节点首期能力，应用端口仍使用 Node runtime manifest 中发布的静态 `host_port`；端口被占用时部署失败，不会覆写其他实例。多 Project 端口预留、租户路由和公网反向代理仍是上线前工作。
 
 Node 不写 Project 本地状态，不启动部署机进程，也不直接管理 Orchestrator `runtime/` 目录。
+
+## 4a. AgentRuntime 制品：市场制品到 Hub 实例
+
+除容器清单外，`runtime.json` 可以声明 `kind: "AgentRuntime"`，表示该制品定义的是一个 Agent Runtime 实例而不是容器。它与容器制品走同一套 checksum、release digest 与 Ed25519 验签，**不得**携带 `compose.yaml`：
+
+```json
+{
+  "api_version": "yeying.app/v1",
+  "kind": "AgentRuntime",
+  "app_id": "nightly-digest",
+  "version": "1.0.0",
+  "runtime_type": "codex",
+  "deployment_mode": "scheduled",
+  "schedule": {"kind": "cron", "expr": "0 9 * * 1-5", "timezone": "Asia/Shanghai"},
+  "task": {"prompt": "Summarize yesterday's commits.", "codex_sandbox": "read-only", "run_timeout_seconds": 600},
+  "model": null
+}
+```
+
+- `runtime_type` ∈ `codex` | `claude-code` | `openclaw`。CLI 运行时使用 `task`（`prompt`、`codex_sandbox` 或 `claude_permission_mode`、`run_timeout_seconds`），恒为 `scheduled`；OpenClaw 使用 `openclaw`（仅 `kind: "whatsapp"` 与可选 `template`），可为 `service` 或 `scheduled`。
+- 验签之后，`ReleaseVerifier` 直接用 Hub 协议模型（`HubCliTaskCreatePayloadV1` / `HubOpenClawCreatePayloadV1`）构造创建 payload。制品因此无法表达 Hub 会拒绝的内容：两个 CLI 的 bypass 模式、未知字段、任何 secret。DingTalk 工作负载需要 client secret，故不允许出现在签名公开制品中。
+- 实例显示名取 `application.json` 的 `metadata.name["en-US"]`（或首个非空值），回退为 `app_id`。
+
+### Worker 到 Backend 的实例 API
+
+lifecycle worker 不连接数据库、也不直接连接 Hub。它通过 `HUB_WORKER_TOKEN` 调用：
+
+| 方法 | 路径 | 行为 |
+| --- | --- | --- |
+| POST | `/api/v1/internal/runtime/instances` | body：`owner_id`、`runtime_type`、`instance_id`、`create_payload`（typed）。按 `instance_id` 幂等：已存在且 owner/runtime 一致则返回 `created=false`，不再下发命令；Hub 离线返回 503；adapter 未申报返回 409 |
+| POST | `/api/v1/internal/runtime/instances/{id}/delete` | 不存在返回 `deleted=false, reason=INSTANCE_NOT_FOUND`；否则下发 `delete_instance` 并等待结果 |
+
+两者都由 Backend 经 `MachineHubService` 向配置的 `HUB_ID` 下发 typed 命令并等待终态；命令、事件与审计与控制台发起的操作完全相同。
+
+### 执行器行为
+
+- 实例 id 按 `(runtime_type, app_id, owner)` 稳定；`install` 创建，`upgrade` 先删旧定义再建新定义（Hub 保留 workspace 与运行日志，只有目录项被替换），`uninstall` 删除。容器制品不能原地替换 agent 安装（`RELEASE_KIND_CHANGED`）。
+- `current.json` 记录 `instance_id` 与 `runtime`；失败报告对 agent 安装不探活容器，若升级时旧定义已删而新建失败，报告 `previous_removed=true` 并清空 `current.json`。
+- 错误分类：`HUB_UNAVAILABLE`（可重试）、`HUB_REJECTED`、`HUB_COMMAND_FAILED`、`INVALID_AGENT_RUNTIME`、`INSTANCE_NOT_FOUND`、`AGENT_GATEWAY_NOT_CONFIGURED`。
+- Project 安装的实例归属 Project owner，不出现在无关钱包的控制台列表；Project 通过 `GET /api/v1/internal/installed` 查看。
 
 ## 5. 兼容边界
 

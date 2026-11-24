@@ -44,3 +44,5 @@ npm run dev
 - [配置说明](docs/configuration.md)
 - [仓库目录结构](docs/repository-layout.md)
 - [控制面详细设计](docs/orchestrator-control-plane-detailed-design.md)
+- [Backend + Hub 架构决策](docs/hub-architecture-adr.md)
+- [市场驱动的异构 Agent 实例部署设计（提案）](docs/marketplace-runtime-deployment-design.md)

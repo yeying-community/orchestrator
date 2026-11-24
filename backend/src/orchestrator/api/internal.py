@@ -2,15 +2,41 @@ from __future__ import annotations
 
 import hmac
 import json
+import re
+from datetime import UTC, datetime, timedelta
+from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Header, HTTPException, Request
+from fastapi import APIRouter, Header, HTTPException, Query, Request, Response
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from orchestrator.config import Settings
 from orchestrator.models import RuntimeNodeHeartbeatRequest, RuntimeNodeListResponse
+from orchestrator.protocols.hub_v1 import (
+    HubCommandIssueRequestV1,
+    HubCommandLeaseV1,
+    HubCommandLeaseRenewalRequestV1,
+    HubCommandOperation,
+    HubCommandPollResponseV1,
+    HubCreatePayloadV1,
+    HubCredentialIssueRequestV1,
+    HubEventBatchRequestV1,
+    HubHeartbeatRequestV1,
+    HubInventorySnapshotV1,
+    InstanceId,
+    RuntimeType,
+)
 from orchestrator.services.nodes import NODE_ID_PATTERN, RuntimeNodeService
+from orchestrator.services.hubs import (
+    HubAuthenticationError,
+    HubConflictError,
+    HubNotFoundError,
+    HubServiceError,
+    MachineHubService,
+)
 from orchestrator.services.runtime import AgentRuntimeState
 
 router = APIRouter(prefix="/api/v1/internal", tags=["internal"])
+HUB_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 
 
 def runtime_state(settings: Settings) -> AgentRuntimeState:
@@ -88,6 +114,37 @@ def require_runtime_node_token(settings: Settings, node_id: str, authorization: 
         raise HTTPException(status_code=401, detail="invalid node agent credentials")
 
 
+def machine_hub_service(settings: Settings) -> MachineHubService:
+    try:
+        return MachineHubService(settings.database_url)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+def authenticate_machine_hub(
+    service: MachineHubService,
+    hub_id: str,
+    authorization: str | None,
+) -> None:
+    if not HUB_ID_PATTERN.fullmatch(hub_id):
+        raise HTTPException(status_code=404, detail="Hub not found")
+    provided = authorization[len("Bearer ") :].strip() if authorization and authorization.startswith("Bearer ") else ""
+    try:
+        service.authenticate(hub_id, provided)
+    except HubAuthenticationError as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+def map_hub_service_error(exc: Exception) -> HTTPException:
+    if isinstance(exc, HubNotFoundError):
+        return HTTPException(status_code=404, detail=str(exc))
+    if isinstance(exc, HubConflictError):
+        return HTTPException(status_code=409, detail=str(exc))
+    return HTTPException(status_code=503, detail=str(exc))
+
+
 def require_worker_attempt(value: int | None) -> int:
     if value is None or value < 1:
         raise HTTPException(status_code=400, detail="X-Worker-Attempt is required")
@@ -149,6 +206,170 @@ async def internal_runtime_nodes(
     return ok(nodes.model_dump())
 
 
+@router.post("/hubs/{hub_id}/credentials")
+async def internal_issue_hub_credential(
+    hub_id: str,
+    payload: HubCredentialIssueRequestV1,
+    response: Response,
+    authorization: str | None = Header(default=None),
+) -> dict:
+    settings = Settings()
+    require_admin_token(settings, authorization)
+    if not HUB_ID_PATTERN.fullmatch(hub_id):
+        raise HTTPException(status_code=404, detail="Hub not found")
+    try:
+        credential = machine_hub_service(settings).issue_credential(hub_id, payload.expires_in_seconds)
+    except (HubNotFoundError, HubConflictError, RuntimeError) as exc:
+        raise map_hub_service_error(exc) from exc
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Pragma"] = "no-cache"
+    return credential.model_dump(mode="json")
+
+
+@router.post("/hubs/{hub_id}/credentials/{credential_id}/revoke")
+async def internal_revoke_hub_credential(
+    hub_id: str,
+    credential_id: str,
+    authorization: str | None = Header(default=None),
+) -> dict:
+    settings = Settings()
+    require_admin_token(settings, authorization)
+    if not HUB_ID_PATTERN.fullmatch(hub_id):
+        raise HTTPException(status_code=404, detail="Hub not found")
+    try:
+        machine_hub_service(settings).revoke_credential(hub_id, credential_id)
+    except (HubNotFoundError, HubConflictError, RuntimeError) as exc:
+        raise map_hub_service_error(exc) from exc
+    return {"credential_id": credential_id, "status": "revoked"}
+
+
+@router.get("/hubs/{hub_id}/credentials")
+async def internal_list_hub_credentials(
+    hub_id: str,
+    authorization: str | None = Header(default=None),
+) -> dict:
+    settings = Settings()
+    require_admin_token(settings, authorization)
+    if not HUB_ID_PATTERN.fullmatch(hub_id):
+        raise HTTPException(status_code=404, detail="Hub not found")
+    try:
+        credentials = machine_hub_service(settings).list_credentials(hub_id)
+    except (HubNotFoundError, HubConflictError, RuntimeError) as exc:
+        raise map_hub_service_error(exc) from exc
+    return {"items": [item.model_dump(mode="json") for item in credentials]}
+
+
+@router.post("/hubs/{hub_id}/heartbeat")
+async def internal_hub_heartbeat(
+    hub_id: str,
+    payload: HubHeartbeatRequestV1,
+    authorization: str | None = Header(default=None),
+) -> dict:
+    settings = Settings()
+    service = machine_hub_service(settings)
+    authenticate_machine_hub(service, hub_id, authorization)
+    try:
+        return service.heartbeat(hub_id, payload).model_dump(mode="json")
+    except (HubNotFoundError, HubConflictError, RuntimeError) as exc:
+        raise map_hub_service_error(exc) from exc
+
+
+@router.put("/hubs/{hub_id}/inventory")
+async def internal_hub_inventory(
+    hub_id: str,
+    payload: HubInventorySnapshotV1,
+    authorization: str | None = Header(default=None),
+) -> dict:
+    settings = Settings()
+    service = machine_hub_service(settings)
+    authenticate_machine_hub(service, hub_id, authorization)
+    try:
+        return service.update_inventory(hub_id, payload).model_dump(mode="json")
+    except (HubNotFoundError, HubConflictError, RuntimeError) as exc:
+        raise map_hub_service_error(exc) from exc
+
+
+@router.post("/hubs/{hub_id}/commands", status_code=202)
+async def internal_issue_hub_command(
+    hub_id: str,
+    payload: HubCommandIssueRequestV1,
+    authorization: str | None = Header(default=None),
+) -> dict:
+    settings = Settings()
+    require_admin_token(settings, authorization)
+    if not HUB_ID_PATTERN.fullmatch(hub_id):
+        raise HTTPException(status_code=404, detail="Hub not found")
+    try:
+        return machine_hub_service(settings).issue_command(hub_id, payload).model_dump(mode="json")
+    except (HubNotFoundError, HubConflictError, RuntimeError) as exc:
+        raise map_hub_service_error(exc) from exc
+
+
+@router.get("/hubs/{hub_id}/commands/{command_id}")
+async def internal_get_hub_command_status(
+    hub_id: str,
+    command_id: UUID,
+    authorization: str | None = Header(default=None),
+) -> dict:
+    settings = Settings()
+    require_admin_token(settings, authorization)
+    if not HUB_ID_PATTERN.fullmatch(hub_id):
+        raise HTTPException(status_code=404, detail="Hub not found")
+    try:
+        status = machine_hub_service(settings).command_status_summary(hub_id, str(command_id))
+    except RuntimeError as exc:
+        raise map_hub_service_error(exc) from exc
+    if status is None:
+        raise HTTPException(status_code=404, detail="Hub command not found")
+    return status
+
+
+@router.get("/hubs/{hub_id}/commands", response_model=HubCommandPollResponseV1)
+async def internal_poll_hub_commands(
+    hub_id: str,
+    limit: int = Query(default=10, ge=1, le=50),
+    authorization: str | None = Header(default=None),
+) -> dict:
+    settings = Settings()
+    service = machine_hub_service(settings)
+    authenticate_machine_hub(service, hub_id, authorization)
+    try:
+        return service.claim_commands(hub_id, limit).model_dump(mode="json")
+    except (HubNotFoundError, HubConflictError, RuntimeError) as exc:
+        raise map_hub_service_error(exc) from exc
+
+
+@router.post("/hubs/{hub_id}/commands/{command_id}/lease", response_model=HubCommandLeaseV1)
+async def internal_renew_hub_command_lease(
+    hub_id: str,
+    command_id: UUID,
+    payload: HubCommandLeaseRenewalRequestV1,
+    authorization: str | None = Header(default=None),
+) -> dict:
+    settings = Settings()
+    service = machine_hub_service(settings)
+    authenticate_machine_hub(service, hub_id, authorization)
+    try:
+        return service.renew_command_lease(hub_id, str(command_id), payload.attempt).model_dump(mode="json")
+    except (HubNotFoundError, HubConflictError, RuntimeError) as exc:
+        raise map_hub_service_error(exc) from exc
+
+
+@router.post("/hubs/{hub_id}/events")
+async def internal_hub_events(
+    hub_id: str,
+    payload: HubEventBatchRequestV1,
+    authorization: str | None = Header(default=None),
+) -> dict:
+    settings = Settings()
+    service = machine_hub_service(settings)
+    authenticate_machine_hub(service, hub_id, authorization)
+    try:
+        return service.accept_events(hub_id, payload).model_dump(mode="json")
+    except (HubNotFoundError, HubConflictError, RuntimeError) as exc:
+        raise map_hub_service_error(exc) from exc
+
+
 async def handle_lifecycle(action: str, request: Request, x_yeying_instance: str | None) -> dict:
     settings = Settings()
     state = runtime_state(settings)
@@ -184,6 +405,118 @@ async def internal_task(
     if task is None or task.get("owner_id", task.get("instance_id", "project")) != str(x_yeying_instance or "project"):
         raise HTTPException(status_code=404, detail="task not found")
     return ok({"task": task})
+
+
+class InternalRuntimeInstanceCreate(BaseModel):
+    """Worker request to turn a verified marketplace artifact into a Hub-managed instance."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    owner_id: str = Field(min_length=1, max_length=255)
+    runtime_type: RuntimeType
+    instance_id: InstanceId
+    create_payload: HubCreatePayloadV1
+    # Target machine; when several Hubs can run this runtime it must be set.
+    target_hub_id: str | None = None
+
+
+@router.post("/runtime/instances")
+async def internal_create_runtime_instance(
+    request: Request,
+    authorization: str | None = Header(default=None),
+    x_worker_id: str | None = Header(default=None),
+) -> dict:
+    """Create a catalog instance on a Hub for the lifecycle worker.
+
+    Idempotent on instance_id: a retried task finds the existing instance and does
+    not issue a second create command.
+    """
+    from orchestrator.api.public import _await_hub_command
+
+    settings = Settings()
+    require_worker_token(settings, authorization)
+    if not settings.database_url:
+        raise HTTPException(status_code=503, detail="Machine Hub catalog is not configured for this Backend")
+    try:
+        body = InternalRuntimeInstanceCreate.model_validate(await request_payload(request))
+    except ValidationError as exc:
+        raise HTTPException(status_code=422, detail=exc.errors()) from exc
+    hub_service = machine_hub_service(settings)
+    try:
+        existing = hub_service.catalog_instance(body.instance_id)
+        if existing is not None:
+            if existing.get("owner_id") != body.owner_id or existing.get("runtime_type") != body.runtime_type:
+                raise HTTPException(status_code=409, detail="instance id belongs to another owner or runtime")
+            return ok({"instance": existing, "created": False})
+        hub_id = hub_service.select_placement_hub(body.runtime_type, body.target_hub_id)
+        command = HubCommandIssueRequestV1(
+            target_instance_id=body.instance_id,
+            runtime_type=body.runtime_type,
+            operation=HubCommandOperation.CREATE_INSTANCE,
+            idempotency_key=f"worker-create-{uuid4().hex}",
+            desired_revision=1,
+            trace_id=f"worker-create-{uuid4().hex}",
+            expires_at=datetime.now(UTC) + timedelta(minutes=2),
+            create_payload=body.create_payload,
+        )
+        receipt = hub_service.issue_command(
+            hub_id,
+            command,
+            actor=f"worker:{str(x_worker_id or '').strip() or 'unknown'}",
+            catalog_owner_id=body.owner_id,
+        )
+    except HubServiceError as exc:
+        raise map_hub_service_error(exc) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    await _await_hub_command(hub_service, hub_id, str(receipt.command_id), "create")
+    try:
+        created = hub_service.catalog_instance(body.instance_id)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    if created is None:
+        raise HTTPException(status_code=502, detail="Hub created the instance but the catalog has no record of it")
+    return ok({"instance": created, "created": True, "hub_id": hub_id})
+
+
+@router.post("/runtime/instances/{instance_id}/delete")
+async def internal_delete_runtime_instance(
+    instance_id: str,
+    authorization: str | None = Header(default=None),
+    x_worker_id: str | None = Header(default=None),
+) -> dict:
+    from orchestrator.api.public import _await_hub_command
+
+    settings = Settings()
+    require_worker_token(settings, authorization)
+    if not settings.database_url:
+        raise HTTPException(status_code=503, detail="Machine Hub catalog is not configured for this Backend")
+    hub_service = machine_hub_service(settings)
+    try:
+        existing = hub_service.catalog_instance(instance_id)
+        if existing is None:
+            return ok({"deleted": False, "reason": "INSTANCE_NOT_FOUND"})
+        hub_id = str(existing["hub_id"])
+        if not hub_service.is_online(hub_id):
+            raise HTTPException(status_code=503, detail="Machine Hub is offline")
+        command = HubCommandIssueRequestV1(
+            target_instance_id=instance_id,
+            runtime_type=str(existing["runtime_type"]),
+            operation=HubCommandOperation.DELETE_INSTANCE,
+            idempotency_key=f"worker-delete-{uuid4().hex}",
+            desired_revision=hub_service.next_desired_revision(hub_id, instance_id),
+            trace_id=f"worker-delete-{uuid4().hex}",
+            expires_at=datetime.now(UTC) + timedelta(minutes=5),
+        )
+        receipt = hub_service.issue_command(hub_id, command, actor=f"worker:{str(x_worker_id or '').strip() or 'unknown'}")
+    except HubServiceError as exc:
+        raise map_hub_service_error(exc) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    await _await_hub_command(hub_service, hub_id, str(receipt.command_id), "delete", timeout_seconds=60)
+    return ok({"deleted": True})
 
 
 @router.post("/tasks/claim")

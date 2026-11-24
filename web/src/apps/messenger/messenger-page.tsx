@@ -19,6 +19,7 @@ import { Badge } from '../../components/ui/badge'
 import { Button } from '../../components/ui/button'
 import { Input } from '../../components/ui/input'
 import { Panel } from '../../components/ui/panel'
+import { PageHeader } from '../../components/ui/page-header'
 import { ScrollArea } from '../../components/ui/scroll-area'
 import { Select } from '../../components/ui/select'
 import { StatCard } from '../../components/ui/stat-card'
@@ -26,6 +27,7 @@ import {
   useMessengerInstanceAction,
   useMessengerInstanceCreate,
   useMessengerWhatsappPair,
+  useRuntimeInstanceAction,
 } from '../../platform/agents/mutations'
 import {
   useRuntimeInstanceDiagnose,
@@ -35,7 +37,8 @@ import {
   useAgentWorkspaceSummary,
 } from '../../platform/agents/queries'
 import { cn } from '../../platform/core/utils'
-import type { BotInstanceView } from '../../platform/core/types'
+import { scheduleLabel } from '../../platform/core/schedule'
+import type { BotInstanceView, DeploymentMode, InstanceSchedule } from '../../platform/core/types'
 
 const EMPTY_INSTANCES: BotInstanceView[] = []
 
@@ -52,6 +55,19 @@ type MessengerCreateForm = {
   template: string
   dingtalk_client_id: string
   dingtalk_client_secret: string
+  deployment_mode: DeploymentMode
+  schedule_kind: 'cron' | 'interval'
+  schedule_expr: string
+  schedule_minutes: string
+  schedule_timezone: string
+}
+
+function buildSchedule(values: MessengerCreateForm): InstanceSchedule | null {
+  if (values.deployment_mode !== 'scheduled') return null
+  if (values.schedule_kind === 'interval') {
+    return { kind: 'interval', expr: null, seconds: Math.round(Number(values.schedule_minutes) * 60), timezone: null }
+  }
+  return { kind: 'cron', expr: values.schedule_expr.trim(), seconds: null, timezone: values.schedule_timezone.trim() || null }
 }
 
 export function MessengerPage() {
@@ -75,6 +91,7 @@ export function MessengerPage() {
   const stopAction = useMessengerInstanceAction(selectedInstance?.id ?? null, 'stop')
   const createInstance = useMessengerInstanceCreate()
   const pairWhatsapp = useMessengerWhatsappPair(selectedInstance?.id ?? null)
+  const runtimeAction = useRuntimeInstanceAction()
   const form = useForm<MessengerCreateForm>({
     defaultValues: {
       kind: 'whatsapp',
@@ -83,6 +100,11 @@ export function MessengerPage() {
       template: 'ecommerce-toy',
       dingtalk_client_id: '',
       dingtalk_client_secret: '',
+      deployment_mode: 'service',
+      schedule_kind: 'cron',
+      schedule_expr: '0 9 * * 1-5',
+      schedule_minutes: '60',
+      schedule_timezone: Intl.DateTimeFormat().resolvedOptions().timeZone ?? '',
     },
   })
 
@@ -107,6 +129,8 @@ export function MessengerPage() {
     typeof summaryState.template === 'string' && summaryState.template ? summaryState.template : '未设置'
   const kinds = Array.isArray(summaryState.kinds) ? summaryState.kinds.join(' / ') : 'WhatsApp / DingTalk'
   const selectedKind = form.watch('kind')
+  const selectedMode = form.watch('deployment_mode')
+  const selectedScheduleKind = form.watch('schedule_kind')
   const agentTypes = agentTypesQuery.data?.agentTypes ?? []
 
   async function onCreate(values: MessengerCreateForm) {
@@ -117,6 +141,8 @@ export function MessengerPage() {
       template: values.template || null,
       dingtalk_client_id: values.dingtalk_client_id || null,
       dingtalk_client_secret: values.dingtalk_client_secret || null,
+      deployment_mode: values.deployment_mode,
+      schedule: buildSchedule(values),
     })
     form.reset({
       ...values,
@@ -125,31 +151,29 @@ export function MessengerPage() {
   }
 
   return (
-    <div className="space-y-6">
-      <div className="rounded-md border border-slate-200 bg-white px-6 py-5">
-        <div className="flex flex-wrap items-center gap-2 text-sm text-slate-500">
-          <Link to="/agents" className="hover:text-slate-900">
-            智能体
-          </Link>
-          <ChevronRight className="h-4 w-4" />
-            <span className="text-slate-900">消息应用</span>
-        </div>
-        <div className="mt-3 flex flex-wrap items-end justify-between gap-4">
-          <div>
-            <h1 className="text-2xl font-semibold text-slate-950">消息应用</h1>
-            <p className="mt-1 text-sm text-slate-500">配置消息通道实例，并检查连接、配对和运行日志。</p>
-          </div>
-          <div className="flex items-center gap-3">
+    <div className="app-page">
+      <PageHeader
+        breadcrumb={
+          <>
+            <Link to="/agents">应用</Link>
+            <ChevronRight className="h-3.5 w-3.5" aria-hidden="true" />
+            <span>消息应用</span>
+          </>
+        }
+        title="消息应用"
+        description="配置消息通道实例，并检查连接、配对和运行日志。"
+        actions={
+          <>
             <Badge variant={data?.available ? 'success' : 'muted'}>{data?.available ? '已接入' : '未接入'}</Badge>
-            <Button variant="outline" onClick={() => void refetch()}>
+            <Button variant="outline" onClick={() => void refetch()} disabled={isFetching}>
               <RefreshCw className={isFetching ? 'h-4 w-4 animate-spin' : 'h-4 w-4'} />
               {isFetching ? '刷新中...' : '刷新'}
             </Button>
-          </div>
-        </div>
-      </div>
+          </>
+        }
+      />
 
-      <div className="grid gap-4 md:grid-cols-3">
+      <div className="metric-cards">
         {cards.map((card) => {
           return <StatCard key={card.label} icon={card.icon} label={card.label} value={card.value} />
         })}
@@ -229,6 +253,50 @@ export function MessengerPage() {
                 <option value="generic">generic</option>
               </Select>
             </div>
+            <div className="grid gap-2">
+              <label htmlFor="messenger-deployment-mode" className="text-sm font-medium text-slate-700">部署形态</label>
+              <Select id="messenger-deployment-mode" {...form.register('deployment_mode')}>
+                <option value="service">常驻服务</option>
+                <option value="scheduled">定时任务</option>
+              </Select>
+            </div>
+            {selectedMode === 'scheduled' ? (
+              <>
+                <div className="grid gap-2">
+                  <label htmlFor="messenger-schedule-kind" className="text-sm font-medium text-slate-700">计划类型</label>
+                  <Select id="messenger-schedule-kind" {...form.register('schedule_kind')}>
+                    <option value="cron">Cron 表达式</option>
+                    <option value="interval">固定间隔</option>
+                  </Select>
+                </div>
+                {selectedScheduleKind === 'interval' ? (
+                  <div className="grid gap-2">
+                    <label htmlFor="messenger-schedule-minutes" className="text-sm font-medium text-slate-700">间隔（分钟，≥ 1）</label>
+                    <Input
+                      id="messenger-schedule-minutes"
+                      type="number"
+                      min={1}
+                      step={1}
+                      {...form.register('schedule_minutes', { required: true, min: 1 })}
+                    />
+                  </div>
+                ) : (
+                  <>
+                    <div className="grid gap-2">
+                      <label htmlFor="messenger-schedule-expr" className="text-sm font-medium text-slate-700">Cron 表达式</label>
+                      <Input id="messenger-schedule-expr" {...form.register('schedule_expr', { required: true })} placeholder="分 时 日 月 周，例如 0 9 * * 1-5" />
+                    </div>
+                    <div className="grid gap-2">
+                      <label htmlFor="messenger-schedule-timezone" className="text-sm font-medium text-slate-700">时区</label>
+                      <Input id="messenger-schedule-timezone" {...form.register('schedule_timezone')} placeholder="例如 Asia/Shanghai" />
+                    </div>
+                  </>
+                )}
+                <div className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800 md:col-span-2 xl:col-span-4" role="note">
+                  定时任务目前的单次运行是一次诊断探针，用于验证调度链路，不是 Agent 任务；创建后需在实例详情中启用计划才会按计划触发。
+                </div>
+              </>
+            ) : null}
             {selectedKind === 'dingtalk' ? (
               <>
                 <div className="grid gap-2">
@@ -296,10 +364,17 @@ export function MessengerPage() {
                         {instance.status}
                       </Badge>
                     </div>
+                    {instance.deployment_mode === 'scheduled' ? (
+                      <div className="mt-2 flex flex-wrap gap-2">
+                        <Badge variant="muted">定时任务</Badge>
+                        <Badge variant={instance.desired_state === 'running' ? 'success' : 'muted'}>{instance.desired_state === 'running' ? '计划已启用' : '计划未启用'}</Badge>
+                      </div>
+                    ) : null}
                     <div className="mt-3 grid gap-2 text-xs text-slate-500">
                       <div>端口：{instance.port}</div>
                       <div>模型：{instance.model}</div>
                       <div>Profile：{instance.profile}</div>
+                      {instance.deployment_mode === 'scheduled' ? <div>计划：{scheduleLabel(instance.schedule)}</div> : null}
                     </div>
                   </button>
                 ))
@@ -331,24 +406,57 @@ export function MessengerPage() {
                     </Badge>
                     <Badge variant="muted">端口：{selectedInstance.port}</Badge>
                     <Badge variant="muted">PID：{selectedInstance.pid ?? '-'}</Badge>
+                    {selectedInstance.deployment_mode === 'scheduled' ? (
+                      <>
+                        <Badge variant="muted">定时任务 · {scheduleLabel(selectedInstance.schedule)}</Badge>
+                        <Badge variant={selectedInstance.desired_state === 'running' ? 'success' : 'muted'}>{selectedInstance.desired_state === 'running' ? '计划已启用' : '计划未启用'}</Badge>
+                      </>
+                    ) : null}
                   </div>
                 </div>
                 <div className="flex flex-wrap gap-3">
-                  <Button
-                    onClick={() => startAction.mutate()}
-                    disabled={startAction.isPending || selectedInstance.status === 'running'}
-                  >
-                    <Play className="h-4 w-4" />
-                    {startAction.isPending ? '启动中...' : '启动'}
-                  </Button>
-                  <Button
-                    variant="outline"
-                    onClick={() => stopAction.mutate()}
-                    disabled={stopAction.isPending || selectedInstance.status !== 'running'}
-                  >
-                    <SquareTerminal className="h-4 w-4" />
-                    {stopAction.isPending ? '停止中...' : '停止'}
-                  </Button>
+                  {selectedInstance.deployment_mode === 'scheduled' ? (
+                    <>
+                      {selectedInstance.desired_state === 'running' ? (
+                        <Button variant="outline" onClick={() => stopAction.mutate()} disabled={stopAction.isPending}>
+                          <SquareTerminal className="h-4 w-4" />
+                          {stopAction.isPending ? '停用中...' : '停用计划'}
+                        </Button>
+                      ) : (
+                        <Button onClick={() => startAction.mutate()} disabled={startAction.isPending}>
+                          <Play className="h-4 w-4" />
+                          {startAction.isPending ? '启用中...' : '启用计划'}
+                        </Button>
+                      )}
+                      <Button
+                        variant="outline"
+                        onClick={() => runtimeAction.mutate({ instanceId: selectedInstance.id, action: 'run' })}
+                        disabled={runtimeAction.isPending}
+                      >
+                        <Play className="h-4 w-4" />
+                        {runtimeAction.isPending ? '运行中...' : '运行一次'}
+                      </Button>
+                      <Link to="/runtime" className="self-center text-sm text-emerald-700">查看运行历史</Link>
+                    </>
+                  ) : (
+                    <>
+                      <Button
+                        onClick={() => startAction.mutate()}
+                        disabled={startAction.isPending || selectedInstance.status === 'running'}
+                      >
+                        <Play className="h-4 w-4" />
+                        {startAction.isPending ? '启动中...' : '启动'}
+                      </Button>
+                      <Button
+                        variant="outline"
+                        onClick={() => stopAction.mutate()}
+                        disabled={stopAction.isPending || selectedInstance.status !== 'running'}
+                      >
+                        <SquareTerminal className="h-4 w-4" />
+                        {stopAction.isPending ? '停止中...' : '停止'}
+                      </Button>
+                    </>
+                  )}
                   {selectedInstance.kind === 'whatsapp' ? (
                     <Button
                       variant="outline"
